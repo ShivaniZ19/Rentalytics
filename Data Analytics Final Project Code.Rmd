@@ -1,0 +1,949 @@
+---
+title: "Final Project"
+author: "Kael Ecord"
+date: "2024-04-22"
+output: html_document
+---
+
+# Final Project
+
+Load Packages
+
+```{r include=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(leaps)
+library(glmnet)
+library(car)
+library(tree)
+library(rpart)
+library(randomForest)
+library(gbm)
+
+library(class)
+library(MASS)
+library(ggplot2)
+library(corrplot)
+library(nnet)
+
+library(sf)
+library(moments)
+library(reshape2)
+```
+
+Load Data
+
+```{r}
+apt_data <- read_xlsx('C:/Users/kaele/OneDrive/Documents/IUPUI/Spring 2024/H515 - Data Analytics/Final Project/apartment_data.xlsx')
+```
+
+## Data Cleaning and Preprocessing
+
+#### Filter Criteria
+
+Filter data to include only apartments and listings with prices listed as monthly.
+
+```{r}
+apt_data <- apt_data |>
+  filter(category == 'housing/rent/apartment',
+         price_type == 'Monthly', 
+         !is.na(state),
+         !is.na(price),
+         !is.na(bathrooms),
+         !is.na(bedrooms))
+```
+
+#### Create new studio column
+
+Create a new binary column called 'studio'. If the title column contains the word 'Studio' or 'studio' then the new column will have value 1 else 0.
+
+```{r}
+contains_studio <- function(title) {
+  ifelse(grepl("studio", title, ignore.case = TRUE),1,0)
+}
+
+apt_data$studio <- sapply(apt_data$title, contains_studio)
+```
+
+#### Create cats_allowed and dogs_allowed columns
+
+```{r}
+contains_dogs <- function(text) {
+  ifelse(grepl("cats", text, ignore.case = TRUE),1,0)
+}
+contains_cats <- function(text) {
+  ifelse(grepl("dogs", text, ignore.case = TRUE),1,0)
+}
+
+apt_data$dogs_allowed <- sapply(apt_data$pets_allowed, contains_dogs)
+apt_data$cats_allowed <- sapply(apt_data$pets_allowed, contains_cats)
+```
+
+#### Create US Region Column
+
+[List of regions of the United States - Wikipedia](https://en.wikipedia.org/wiki/List_of_regions_of_the_United_States)
+
+Create a new column called "region". This column will describe the region of the country that the apartment listing in from. The regions will be based on the US Census Bureau regions.
+
+```{r}
+# Define Region Lists
+west <- c('AK','HI','WA','OR','CA','NV','ID','MT','WY','UT','AZ','NM','CO')
+midwest <- c('ND','SD','NE','KS','MO','IA','MN','WI','IL','IN','OH','MI')
+south <- c('TX','OK','AR','LA','MS','AL','TN','KY','FL','GA','SC','NC',
+           'VA','WV','MD','DE','DC')
+northeast <- c('PA','NJ','NY','CT','RI','MA','VT','NH','ME')
+
+apt_data <- apt_data %>%
+  mutate(us_region = case_when(
+    state %in% west ~ "West",
+    state %in% midwest ~ "Midwest",
+    state %in% south ~ "South",
+    state %in% northeast ~ "Northeast",
+    TRUE ~ "not present"
+  ))
+```
+
+Check that all rows have a value for region
+
+```{r}
+nrow(apt_data |>
+         filter(us_region == 'not present'))
+```
+
+#### Create US Division column
+
+[List of regions of the United States - Wikipedia](https://en.wikipedia.org/wiki/List_of_regions_of_the_United_States)
+
+Create a new column called "division". This column will describe the division of the country that the apartment listing in from. The regions will be based on the US Census Bureau divisions.
+
+```{r}
+pacific <- c('AK', 'HI', 'CA', 'OR', 'WA')
+mountain <- c('NV', 'ID', 'MT', 'WY', 'UT', 'CO', 'AZ', 'NM')
+west_north_central <- c('ND', 'SD', 'NE', 'KS', 'MN', 'IA', 'MO')
+east_north_central <- c('WI', 'MI', 'IL', 'IN', 'OH')
+west_south_central <- c('TX', 'OK', 'AR', 'LA')
+east_south_central <- c('KY', 'TN', 'MS', 'AL')
+south_atlantic <- c('FL', 'GA', 'SC', 'NC', 'VA', 'WV', 'MD', 'DC', 'DE')
+middle_atlantic <- c('PA', 'NJ', 'NY')
+new_england <- c('CT', 'RI', 'MA', 'VT', 'NH', 'ME')
+
+apt_data <- apt_data %>%
+  mutate(us_division = case_when(
+    state %in% pacific ~ "Pacific",
+    state %in% mountain ~ "Mountain",
+    state %in% west_north_central ~ "West North Central",
+    state %in% east_north_central ~ "East North Central",
+    state %in% west_south_central ~ "West South Central",
+    state %in% east_south_central ~ "East South Central",
+    state %in% south_atlantic ~ "South Atlantic",
+    state %in% middle_atlantic ~ "Middle Atlantic",
+    state %in% new_england ~ "New England",
+    TRUE ~ "not present"
+  ))
+```
+
+Check that all rows have a value for division
+
+```{r}
+nrow(apt_data |>
+         filter(us_division == 'not present'))
+```
+
+#### Map Yes/No to binary values for fee and has_photo
+
+```{r}
+apt_data$fee <- ifelse(apt_data$fee == "Yes", 1, 0)
+apt_data$has_photo <- ifelse(apt_data$has_photo == "No", 0, 1)
+```
+
+#### Create categorical variable for price
+
+```{r}
+# Calculating the 33rd and 67th percentiles of the price column
+price_percentiles <- quantile(apt_data$price, c(0.33, 0.67))
+
+# Creating a new categorical variable "price_category" based on the price percentiles
+apt_data$price_category <- cut(apt_data$price,
+                           breaks = c(-Inf, price_percentiles[1],
+                                      price_percentiles[2], Inf),
+                           labels = c("Low", "Medium", "High"),
+                           include.lowest = TRUE)
+apt_data$price_category <- as.factor(apt_data$price_category)
+
+```
+
+```{r}
+# Counting the number of instances in each price category
+class_counts <- table(apt_data$price_category)
+print(class_counts)
+```
+
+#### Remove unnecessary columns
+
+```{r}
+apt_data <- subset(apt_data, select = -c(id, category, title, body, 
+                                         amenities, currency, price_display,
+                                         price_type, address, cityname, source,
+                                         time, pets_allowed))
+
+```
+
+#### Write final DF to excel file
+
+```{r}
+write_xlsx(apt_data, 'C:/Users/kaele/OneDrive/Documents/IUPUI/Spring 2024/H515 - Data Analytics/Final Project/apartment_data_final.xlsx')
+```
+
+## Data Exploration
+
+```{r}
+dim(apt_data)
+str(apt_data)
+
+average_price_by_region <- apt_data %>%
+  group_by(us_region) %>%
+  summarise(average_price = mean(price, na.rm = TRUE)) %>%
+  arrange(desc(average_price))
+
+# Printing the results
+print(average_price_by_region)
+```
+
+#### Aggregating Data for Analysis
+
+```{r}
+average_price_by_region <- apt_data %>%
+  group_by(us_region) %>%
+  summarise(average_price = mean(price, na.rm = TRUE)) %>%
+  arrange(desc(average_price))
+
+# Printing the results
+print(average_price_by_region)
+
+# Average price by state
+state_avg_price <- apt_data %>%
+  group_by(state) %>%
+  summarise(average_price = mean(price, na.rm = TRUE))
+print(state_avg_price)
+
+# Average price by presence of photos
+photo_avg_price <- apt_data %>%
+  group_by(has_photo) %>%
+  summarise(average_price = mean(price, na.rm = TRUE))
+print(photo_avg_price)
+
+# Average price by region and division
+region_division_avg_price <- apt_data %>%
+  group_by(us_region, us_division) %>%
+  summarise(average_price = mean(price, na.rm = TRUE))
+print(region_division_avg_price)
+
+# Average price for studios
+studio_avg_price <- apt_data %>%
+  group_by(studio) %>%
+  summarise(average_price = mean(price, na.rm = TRUE))
+print(studio_avg_price)
+
+# Average price considering pet policy
+pet_avg_price <- apt_data %>%
+  group_by(dogs_allowed, cats_allowed) %>%
+  summarise(average_price = mean(price, na.rm = TRUE))
+print(pet_avg_price)
+```
+
+#### Exploring Boolean and Numerical Variables
+
+```{r}
+bool_vars <- names(apt_data)[sapply(apt_data, function(x) length(unique(x)) == 2)]
+
+# Display the first few rows of these columns
+head(apt_data[bool_vars])
+```
+
+```{r}
+# Identify numerical variables, excluding boolean ones
+num_vars <- names(apt_data)[sapply(apt_data, is.numeric) & !names(apt_data) %in% bool_vars]
+
+print(paste('Number of numerical variables: ', length(num_vars)))
+head(apt_data[num_vars])
+```
+
+#### Geo-spatial Visualization
+
+```{r}
+# Create an sf object (adjust as per your previous transformations)
+data_sf <- st_as_sf(apt_data, coords = c("longitude", "latitude"), crs = 4326, agr = "constant")
+
+# Read the world map (adjust the file path to your specific file)
+world <- st_read(system.file("shape/nc.shp", package="sf"))  # Update with your path
+
+# Plotting with adjustments
+ggplot() +
+  geom_sf(data = world, fill = "gray90") +  # Adjusting world map color
+  geom_sf(data = data_sf, aes(color = 'red'), shape = 19, size = 2, alpha = 0.2) +  # Smaller, transparent red points
+  theme_minimal() +
+  labs(title = "Geospatial Plot", x = "Longitude", y = "Latitude")
+```
+
+#### Exploring Discrete Variables
+
+```{r}
+# Identify discrete variables from the set of numerical variables, excluding 'id' and 'price'
+discrete_vars <- num_vars[num_vars != "id" & num_vars != "price" & sapply(apt_data[num_vars], function(x) length(unique(x)) < 20)]
+
+# Print the number of discrete variables
+print(paste('Number of discrete variables: ', length(discrete_vars)))
+
+# Display the first few rows of these discrete variables
+head(apt_data[discrete_vars])
+```
+
+```{r}
+analyse_discrete <- function(df, var) {
+  # Create a variable symbol from the string
+  var_sym <- rlang::sym(var)
+
+  # Creating a summary of median prices by the discrete variable
+  grs <- df %>%
+    group_by(!!var_sym) %>%
+    summarise(price_median = median(price, na.rm = TRUE)) %>%
+    ungroup()
+
+  # Plotting the results
+  p <- ggplot(grs, aes(x = !!var_sym, y = price_median)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    theme_minimal() +
+    labs(title = toupper(var), x = var, y = "Median Price") +
+    theme(plot.title = element_text(hjust = 0.5)) # Center the plot title
+  
+  print(p)
+}
+```
+
+```{r}
+for (var in discrete_vars) {
+  analyse_discrete(apt_data, var)
+}
+```
+
+#### Analyze Continuous Variable Distributions
+
+```{r}
+cont_vars <- num_vars[!(num_vars %in% c(discrete_vars, "id"))]
+
+print(paste('Number of continuous variables: ', length(cont_vars)))
+head(apt_data[cont_vars])
+```
+
+```{r}
+analyse_continuous <- function(df, var) {
+  # Ensure the variable is a symbol for tidy evaluation
+  var_sym <- rlang::sym(var)
+
+  # Remove NA values and prepare data
+  df <- df %>% 
+    filter(!is.na(!!var_sym))
+
+  # Create the distribution plot
+  p <- ggplot(df, aes(x = !!var_sym)) +
+    geom_histogram(aes(y = ..density..), bins = 30, fill = "blue", alpha = 0.7) +
+    geom_density(color = "red", linewidth = 1) +
+    labs(title = var, x = var, y = "Density") +
+    theme_minimal()
+
+  # Calculate skewness and kurtosis
+  skewness <- moments::skewness(df[[var]])
+  kurtosis <- moments::kurtosis(df[[var]])
+
+  # Add annotations for skewness and kurtosis
+  p <- p + annotate("text", x = Inf, y = Inf, label = sprintf("Skewness=%.2f Kurtosis=%.2f", skewness, kurtosis), 
+                    hjust = 1.1, vjust = 2, size = 5, color = "black")
+
+  # Print the plot
+  print(p)
+}
+```
+
+```{r}
+for (var in cont_vars) {
+  analyse_continuous(apt_data, var)
+}
+```
+
+```{r}
+analyse_transformed_continuous <- function(df, var) {
+  # Ensure the variable is a symbol for tidy evaluation
+  var_sym <- rlang::sym(var)
+  
+  # Remove NA values
+  df <- df %>%
+    filter(!is.na(!!var_sym))
+
+  # Skip transformation for 'latitude' or 'longitude'
+  if (var %in% c('latitude', 'longitude')) {
+    message(paste("Skipping transformation for", var))
+  } else {
+    # Apply logarithmic transformation with +1 to handle zero and negative values
+    df <- df %>%
+      mutate(!!var_sym := log1p(!!var_sym))
+  }
+
+  # Create the distribution plot
+  p <- ggplot(df, aes(x = !!var_sym)) +
+    geom_histogram(aes(y = ..density..), bins = 30, fill = "blue", alpha = 0.7) +
+    geom_density(color = "red", size = 1.5) +
+    labs(title = var, x = paste("Transformed", var), y = "Density") +
+    theme_minimal()
+
+  # Calculate skewness and kurtosis
+  skewness_val <- skewness(df[[var]], na.rm = TRUE)
+  kurtosis_val <- kurtosis(df[[var]], na.rm = TRUE) - 3  # Adjust kurtosis to match Python's definition
+
+  # Add annotations for skewness and kurtosis
+  p <- p + annotate("text", x = Inf, y = Inf, label = sprintf("Skewness=%.2f Kurtosis=%.2f", skewness_val, kurtosis_val), 
+                    hjust = 1.1, vjust = 2, size = 5, color = "black")
+
+  # Print the plot
+  print(p)
+}
+
+for (var in cont_vars) {
+  analyse_transformed_continuous(apt_data, var)
+}
+```
+
+#### Visualize Outliers in Continuous Variables
+
+```{r}
+find_outliers <- function(df, var) {
+  # Ensure the variable is a symbol for tidy evaluation
+  var_sym <- rlang::sym(var)
+  
+  # Skip transformation for 'latitude' or 'longitude'
+  if (var %in% c('latitude', 'longitude')) {
+    message(paste("Skipping", var))
+  } else {
+    # Apply logarithmic transformation to handle zero and negative values
+    df <- df %>%
+      mutate(!!var_sym := log1p(!!var_sym))
+  }
+  
+  # Plotting the boxplot
+  p <- ggplot(df, aes_string(x = "1", y = as.character(var_sym))) +
+    geom_boxplot() +
+    labs(title = var, y = paste("Transformed", var)) +
+    theme_minimal() +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank())  # Hide x-axis details
+  
+  # Print the plot
+  print(p)
+}
+for (var in cont_vars) {
+  find_outliers(apt_data, var)
+}
+```
+
+```{r}
+# Create the scatter plot
+p <- ggplot(apt_data, aes(x = square_feet, y = price)) +
+  geom_point() +  # Add points
+  labs(x = "square_feet", y = "price", title = "Price vs. Square Feet") +
+  theme_minimal() +  # Use a minimal theme
+  theme(axis.title.x = element_text(size = 13),  # Customize font size for x label
+        axis.title.y = element_text(size = 13))  # Customize font size for y label
+
+# Display the plot
+print(p)
+```
+
+```{r}
+out_iqr <- function(df, column) {
+  # Calculate the IQR
+  q25 <- quantile(df[[column]], 0.25, na.rm = TRUE)
+  q75 <- quantile(df[[column]], 0.75, na.rm = TRUE)
+  iqr <- q75 - q25
+  
+  # Calculate the outlier cutoff
+  cut_off <- iqr * 1.5
+  lower <- q25 - cut_off
+  upper <- q75 + cut_off
+  
+  # Output the IQR and bounds
+  print(paste("The IQR is", iqr))
+  print(paste("The lower bound value is", lower))
+  print(paste("The upper bound value is", upper))
+  
+  # Calculate the number of outliers
+  num_outliers <- sum(df[[column]] < lower | df[[column]] > upper, na.rm = TRUE)
+  
+  return(print(paste("Total number of outliers are", num_outliers)))
+}
+
+out_iqr(apt_data, 'price')
+
+out_iqr(apt_data, 'square_feet')
+```
+
+```{r}
+# Identifying categorical variables (assuming 'O' stands for object type in Python)
+cat_vars <- names(apt_data)[sapply(apt_data, function(x) is.character(x))]
+
+# Calculating the number of unique values for each categorical variable
+num_unique <- sapply(apt_data[cat_vars], function(x) length(unique(x)))
+
+# Sorting the number of unique values in descending order
+sorted_unique <- sort(num_unique, decreasing = TRUE)
+
+# Display the sorted values
+sorted_unique
+
+analyse_rare_labels <- function(df, var, threshold = 0.01) {
+  # Calculate the frequency of each category
+  freq <- df %>% 
+    group_by(!!rlang::sym(var)) %>%
+    summarise(Count = n(), .groups = 'drop') %>%
+    mutate(Frequency = Count / sum(Count))
+  
+  # Identify rare labels
+  rare_labels <- freq %>% 
+    filter(Frequency < threshold)
+  
+  # Print or return results
+  if (nrow(rare_labels) == 0) {
+    message(paste("No rare labels found in", var))
+  } else {
+    print(rare_labels)
+  }
+  
+  return(invisible(rare_labels))
+}
+
+for (var in cat_vars) {
+  print(analyse_rare_labels(apt_data, var, 0.01))
+}
+```
+
+#### Correlation plot
+
+```{r}
+library(dplyr)
+# Create a dataframe containing only numeric columns
+numeric_df <- apt_data |>
+  dplyr::select(price, bathrooms, bedrooms, fee, has_photo, square_feet, studio, dogs_allowed, cats_allowed)
+
+# Assuming numeric_df is your DataFrame with only numerical columns
+corr_matrix <- cor(numeric_df, use = "complete.obs")  # Computes correlation matrix, handling NA values
+
+# Melt the correlation matrix for ggplot2
+melted_corr_matrix <- melt(corr_matrix)
+
+# Plot the heatmap
+ggplot(melted_corr_matrix, aes(Var1, Var2, fill = value)) +
+  geom_tile() +  # Create tiles for heatmap
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, limit = c(-1,1), space = "Lab", name="Correlation") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels for better readability
+        axis.title = element_blank())  # Remove axis titles
+```
+
+#### Other data exploration
+
+```{r}
+apt_data |>
+  ggplot() +
+  geom_bar(mapping = aes(x = state)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title="Count of Apartment Listing by State",
+       x = "State",
+       y = "# Apartment Listings")
+apt_data |>
+  ggplot() +
+  geom_bar(mapping = aes(x = us_division)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+                                   hjust = 1)) +
+  labs(title="Count of Apartment Listing by State",
+       x = "State",
+       y = "# Apartment Listings")
+apt_data |>
+  ggplot() +
+  geom_bar(mapping = aes(x = us_region)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(title="Count of Apartment Listing by State",
+       x = "State",
+       y = "# Apartment Listings")
+```
+
+```{r}
+apt_data |>
+  filter(price<10000) |>
+  ggplot(aes(x = price)) +
+  geom_histogram(binwidth = 100, fill = "skyblue", color = "black") +
+  geom_vline(aes(xintercept = mean(price), color='Mean')) +
+  geom_vline(aes(xintercept = median(price), color='Median')) +
+  scale_color_manual(name='',
+                     breaks=c('Mean', 'Median'),
+                     values=c('Mean'='orange', 'Median'='red')) + 
+  labs(title = "Apartment Rent Distribution",
+       x = "Rent/Month",
+       y = "Frequency")
+
+summary(apt_data$price)
+```
+
+## Regression Model Building
+
+goal Predict price, look for high leverage points in all models.
+
+#### Model 1 - Simple Linear Regression
+
+The first model we will create is a simple baseline model. For this model we will predict the price based only on the size (square_feet) of the apartment. Initially we log transform the price as initial testing showed that the residuals were not normal. Upon transforming the response variable there appeared to be a parabolic relationship with square_feet so the initial model has the following formula:
+
+$$
+log(price) = \beta_0 + \beta_1(squarefeet) + \beta_2(squarefeet^2) +\epsilon
+$$
+
+```{r}
+slr_mod_inital <- lm(log(price) ~ poly(square_feet,2), data = apt_data)
+summary(slr_mod_inital)
+
+paste("RMSE:", sqrt(mean(slr_mod_inital$residuals^2)))
+
+plot(slr_mod_inital)
+```
+
+Here we can see the summary stats for the initial model described above. All variables in the model were extremely significant suggesting that they are good predictors of the log(price). The RMSE value appears to be low, however we can't make any conclusions about this until other models are generated. Problems with this model start to arise when we look at the summary plots for the model. The QQ plot has values on the tails that begin to fall off the line suggesting that the residuals are not normally distributed. The biggest problem with the model is that there are some points with extremely high leverage values. In particular observation 7071.
+
+```{r}
+apt_data |>
+  filter(square_feet > 5000 | price > 10000) |>
+  summarise(count = n())
+
+apt_data |>
+  ggplot(mapping = aes(x=square_feet, y=price, 
+                       color = ifelse(square_feet>5000 | price >10000,"outlier", "non-outlier"
+                       ))) +
+  geom_point() +
+  scale_color_manual(name="Outlier?",
+                     breaks = c("outlier", "non-outlier"),
+                     values = c("outlier"='red',"non-outlier"="black"))
+```
+
+A simple scatter plot shows us that outside of a range of values we have very few observations. Looking at observations that have price \> 10,000 or square_feet \> 5,000 there are only 89 observations out of a total of 99,000+ observations. For this reason we will remove these values from the dataset and focus on a tighter window of observations.
+
+```{r}
+apt_data <- apt_data |>
+  filter(price <= 10000)|>
+  filter(square_feet <= 5000)
+
+set.seed(2319)
+
+train_index <- sample(1:nrow(apt_data),0.8*nrow(apt_data))
+test_index <- setdiff(1:nrow(apt_data),train_index)
+
+apt_train <- apt_data[train_index,]
+apt_test <- apt_data[test_index,]
+```
+
+```{r}
+slr_mod <- lm(log(price) ~ square_feet, data = apt_train)
+summary(slr_mod)
+
+slr_mod_predictions <- data.frame(log_pred = predict(slr_mod, newdata = apt_test),
+                                  log_actual = log(apt_test$price))
+slr_mod_predictions$pred <- exp(slr_mod_predictions$log_pred)
+slr_mod_predictions$actual <- exp(slr_mod_predictions$log_actual)
+
+slr_test_mse <- mean(((slr_mod_predictions$actual - slr_mod_predictions$pred)^2))
+
+paste("Simple Linear Regression Model Test MSE: ", slr_test_mse)
+```
+
+The above shows that when using a training an testing set even though all variables in the model are significant the test MSE is quite high. This shows that the simple linear regression approach isn't telling the full story.
+
+```{r}
+ggplot(mapping = aes(x = square_feet, y = log(price)), data = apt_data) +
+  geom_point(aes(color = factor(us_region))) +
+  geom_abline(color = "red",
+              slope = slr_mod$coefficients[2], 
+              intercept = slr_mod$coefficients[1])
+```
+
+We can see in the above when coloring the points based on the region of the country they are from begins to shine more light on the story. Here it appears that different regions of the country would have different regression lines. This shows that we need a more complex model.
+
+#### Model 2 - Multiple Linear Regression
+
+Use best subset selection techniques to select best model
+
+```{r}
+# latitude, longitude, state, and us_region removed due to singlularities issues
+# this is caused becuase if you know lat and long you can predict state and region
+# cats_allowed removed due to having VIF value > 3
+full_lr_mod <- lm(price ~ . -state -us_division -longitude -latitude -cats_allowed,
+                  data = apt_data)
+
+vif(full_lr_mod)
+```
+
+```{r}
+apt_best_subset <- regsubsets(price ~ . -state -us_division -longitude -latitude 
+                              -cats_allowed, data = apt_train, nvmax = 10)
+apt_best_subset <- summary(apt_best_subset)
+apt_best_subset
+```
+
+```{r}
+par(mfrow = c(2, 2))
+
+plot(apt_best_subset$adjr2, xlab = "Number of Variables",ylab = "Adjusted RSq", type = "l")
+points(which.max(apt_best_subset$adjr2), apt_best_subset$adjr2[which.max(apt_best_subset$adjr2)], col = "red", cex = 2,pch = 20)
+
+plot(apt_best_subset$cp, xlab = "Number of Variables",ylab = "Cp", type = "l")
+points(which.min(apt_best_subset$cp), apt_best_subset$cp[which.min(apt_best_subset$cp)], col = "red", cex = 2,pch = 20)
+
+plot(apt_best_subset$bic, xlab = "Number of Variables",ylab = "BIC", type = "l")
+points(which.min(apt_best_subset$bic), apt_best_subset$bic[which.min(apt_best_subset$bic)], col = "red", cex = 2,pch = 20)
+```
+
+```{r}
+apt_best_subset$which[7,]
+# Variables in best 7 variable model
+# bathrooms + bedrooms + square_feet + factor(studio) + factor(us_region)
+
+```
+
+```{r}
+apt_subset_7 <- lm(price ~ bathrooms + bedrooms + square_feet + factor(studio) +
+                     factor(us_region), data = apt_train)
+summary(apt_subset_7)
+
+vif(apt_subset_7)
+
+
+subset_mod_predictions <- data.frame(pred = predict(apt_subset_7, 
+                                                    newdata = apt_test),
+                                     actual = apt_test$price)
+
+subset_test_mse <- mean(((subset_mod_predictions$actual - 
+                            subset_mod_predictions$pred)^2))
+
+paste("Best Subset Regression Model Test MSE: ", subset_test_mse)
+```
+
+#### Model 3 - Regression Tree - Random Forest
+
+```{r}
+reg_tree_train <- apt_train |>
+  dplyr::select(price,bathrooms, bedrooms, square_feet, us_region, studio, fee, has_photo, 
+         dogs_allowed, cats_allowed)
+
+reg_tree_train$dogs_allowed <- unname(reg_tree_train$dogs_allowed)
+reg_tree_train$cats_allowed <- unname(reg_tree_train$cats_allowed)
+reg_tree_train$studio <- unname(reg_tree_train$studio)
+
+reg_tree_train_x <- apt_train |>
+  dplyr::select(bathrooms, bedrooms, square_feet, us_region, studio, fee, has_photo, 
+         dogs_allowed, cats_allowed)
+reg_tree_train_y <- apt_train |>
+  dplyr::select(price)
+
+reg_tree_test <- apt_test |>
+  dplyr::select(price,bathrooms, bedrooms, square_feet, us_region, studio, fee, has_photo, 
+         dogs_allowed, cats_allowed)
+
+reg_tree_test$dogs_allowed <- unname(reg_tree_test$dogs_allowed)
+reg_tree_test$cats_allowed <- unname(reg_tree_test$cats_allowed)
+reg_tree_test$studio <- unname(reg_tree_test$studio)
+
+reg_tree_test_x <- apt_test |>
+  dplyr::select(bathrooms, bedrooms, square_feet, us_region, studio, fee, has_photo, 
+         dogs_allowed, cats_allowed)
+reg_tree_test_y <- apt_test |>
+  dplyr::select(price)
+
+```
+
+```{r}
+regTree <- tree(price ~ bathrooms + bedrooms + square_feet + 
+                  factor(us_region) + studio + fee + has_photo + dogs_allowed + 
+                  cats_allowed, data = reg_tree_train)
+
+plot(regTree)
+text(regTree, pretty = 0, cex = 0.6)
+
+predictions <- predict(regTree, newdata = reg_tree_test)
+regTree_test_mse <- mean((apt_test$price - predictions)^2)
+paste("Regression Tree Test MSE: ", regTree_test_mse)
+
+set.seed(2319)
+cv_regTree <- cv.tree(regTree, K = 10)
+plot(y=cv_regTree$dev, x=cv_regTree$size, type = "l")
+```
+
+```{r}
+set.seed(2319)
+
+rfTree <- randomForest(price ~ bathrooms + bedrooms + square_feet + studio + 
+                         fee + has_photo + dogs_allowed + cats_allowed, 
+                       data = reg_tree_train, 
+                       mtry = ceiling(sqrt(dim(reg_tree_train)[2]-1)), 
+                       importance = TRUE)
+
+varImpPlot(rfTree)
+```
+
+```{r}
+plot(rfTree)
+
+rf_predictions <- data.frame(pred = predict(rfTree, new_data = reg_tree_test),
+                                   actual = reg_tree_test$price)
+rf_test_mse <- mean((rf_predictions$actual - rf_predictions$pred)^2)
+paste("Regression Tree Test MSE: ", rf_test_mse)
+```
+
+#### Model 4 - Ridge Regression
+
+```{r}
+grid <- 10^seq(10, -2, length=100)
+
+x_ridge <- model.matrix(price ~ ., apt_data)[,-1]
+y_ridge <- apt_data$price
+y_test_ridge <- y_ridge[test_index]
+
+# Ridge model no CV
+ridge_mod <- glmnet(x_ridge[train_index, ], y_ridge[train_index], lambda = grid, alpha = 0)
+
+ridge_cv <- cv.glmnet(x_ridge[train_index, ], y_ridge[train_index], alpha = 0)
+plot(ridge_cv)
+ridge_bestlambda <- ridge_cv$lambda.min
+ridge_bestlambda
+```
+
+```{r}
+ridge_pred <- predict(ridge_mod, s = ridge_bestlambda, newx = x_ridge[test_index, ])
+ridge_mse <- mean((ridge_pred - y_test_ridge)^2)
+paste("Ridge Method Test MSE: ", ridge_mse)
+```
+
+## Classification Models
+
+```{r}
+apt_cat_data <- subset(apt_data, select = -c(state, us_region, us_division))
+apt_cat_train <- subset(apt_train, select = -c(state, us_region, us_division))
+apt_cat_test <- subset(apt_test, select = -c(state, us_region, us_division))
+```
+
+#### Model 1 - Multinomial Logistic Regression
+
+```{r}
+# Training multinomial logistic regression model using all predictors
+multi_logistic_model <- multinom(price_category ~ ., data = apt_cat_train)
+
+# Making predictions on the test data using the trained model
+multi_logistic_pred <- predict(multi_logistic_model, newdata = apt_cat_test)
+
+# Calculating accuracy of multinomial logistic regression model
+multi_logistic_accuracy <- mean(multi_logistic_pred == apt_cat_test$price_category)
+cat("Multi-logistic regression accuracy:", multi_logistic_accuracy, "\n")
+
+# Creating confusion matrix to evaluate model performance
+actual_values <- apt_cat_test$price_category
+conf_matrix <- table(actual_values, multi_logistic_pred)
+print(conf_matrix)
+```
+
+#### Model 2 - KNN
+
+```{r}
+# Initializing a vector to store accuracies for different values of k
+knn_accuracies <- numeric(10)
+
+apt_train <- na.omit(apt_train)
+apt_test <- na.omit(apt_test)
+
+# Looping through k values from 1 to 10
+for (k in 1:10) {
+  # Training KNN model using the training data
+  knn_model <- knn(train = as.matrix(apt_cat_train[, -ncol(apt_cat_train)]), 
+                   test = as.matrix(apt_cat_test[, -ncol(apt_cat_test)]), 
+                   cl = apt_cat_train$price_category, 
+                   k = k)
+  
+  # Calculating accuracy for the current value of k
+  knn_accuracies[k] <- mean(knn_model == apt_cat_test$price_category)
+}
+
+# Determining the best value of k that maximizes accuracy
+best_k <- which.max(knn_accuracies)
+best_accuracy <- knn_accuracies[best_k]
+
+# Training KNN model using the best value of k
+best_knn_model <- knn(train = as.matrix(apt_cat_train[, -ncol(apt_cat_train)]), 
+                      test = as.matrix(apt_cat_test[, -ncol(apt_cat_test)]), 
+                      cl = apt_cat_train$price_category, 
+                      k = best_k)
+
+# Creating confusion matrix for KNN model
+conf_matrix_knn <- table(actual_values = apt_cat_test$price_category, knn_pred = best_knn_model)
+
+# Printing the best accuracy and corresponding value of k
+cat("Best accuracy for K-nearest neighbors (KNN) is:", best_accuracy, "for k =", best_k, "\n")
+```
+
+#### Model 3 - LDA
+
+```{r}
+# Training LDA model using the training data
+lda_model <- lda(price_category ~ ., data = apt_cat_train)
+
+# Making predictions on the test data using the trained LDA model
+lda_pred <- predict(lda_model, newdata = apt_cat_test)
+
+# Calculating accuracy of the LDA model
+lda_accuracy <- mean(lda_pred$class == apt_cat_test$price_category)
+
+# Creating confusion matrix for LDA model
+confusion_matrix_lda <- table(actual_values = apt_cat_test$price_category, lda_pred$class)
+
+# Printing accuracy of the LDA model
+cat("Accuracy of LDA model:", lda_accuracy, "\n")
+
+```
+
+#### Model 4 - QDA
+
+```{r}
+# Training QDA model using the training data
+qda_model <- qda(price_category ~ ., data = apt_cat_train)
+
+# Making predictions on the test data using the trained QDA model
+qda_pred <- predict(qda_model, newdata = apt_cat_test)
+
+# Creating confusion matrix for QDA model
+confusion_matrix_qda <- table(actual_values = apt_cat_test$price_category, qda_pred$class)
+
+# Calculating accuracy of the QDA model
+qda_accuracy <- mean(qda_pred$class == apt_cat_test$price_category)
+
+# Printing accuracy of the QDA model
+cat("Accuracy of QDA model:", qda_accuracy, "\n")
+```
+
+#### Confusion Matrices
+
+```{r}
+# Confusion matrix for multinomial logistic regression
+print(conf_matrix)
+
+# Confusion matrix for K-nearest neighbors (KNN)
+print(conf_matrix_knn)
+
+# Confusion matrix for LDA
+print(confusion_matrix_lda)
+
+# Confusion matrix for QDA
+print(confusion_matrix_qda)
+
+```
